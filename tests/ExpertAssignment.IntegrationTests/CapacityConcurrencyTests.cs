@@ -116,22 +116,143 @@ public sealed class CapacityConcurrencyTests : IAsyncLifetime
         }
         Assert.Equal(RequestStatus.Pending, created[5].Status);
 
-        await using (var closeScope = _provider.CreateAsyncScope())
-        {
-            var service = closeScope.ServiceProvider.GetRequiredService<IRequestService>();
-            await service.CloseAsync(created[0].Id, CancellationToken.None);
-        }
-        await using (var workerScope = _provider.CreateAsyncScope())
-        {
-            var processor = workerScope.ServiceProvider.GetRequiredService<IQueueProcessor>();
-            Assert.Equal(1, await processor.ProcessBatchAsync(100, CancellationToken.None));
-        }
+        // Close hands the freed slot to the queued request itself; no worker run is needed.
+        await CloseAsync(created[0].Id);
+
+        Assert.Equal(RequestStatus.Closed, await StatusAsync(created[0].Id));
+        Assert.Equal(RequestStatus.Assigned, await StatusAsync(created[5].Id));
         await using var verifyScope = _provider.CreateAsyncScope();
         var verify = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
-        Assert.Equal(RequestStatus.Closed, (await verify.Requests.SingleAsync(x => x.Id == created[0].Id)).Status);
-        Assert.Equal(RequestStatus.Assigned, (await verify.Requests.SingleAsync(x => x.Id == created[5].Id)).Status);
         Assert.Equal(5, await verify.Requests.CountAsync(x => x.Status == RequestStatus.Assigned));
     }
+
+    [Fact]
+    public async Task Picks_expert_with_lowest_open_to_capacity_ratio()
+    {
+        // Task example: expert X has 2 of 4 open (0.5), expert Y has 3 of 10 open (0.3) -> Y.
+        int specialtyId, xId, yId;
+        await using (var scope = _provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var specialty = new Specialty { Name = "RatioCheck" };
+            var x = new Expert { Name = "X", Capacity = 4, ExpertSpecialties = [new ExpertSpecialty { Specialty = specialty }] };
+            var y = new Expert { Name = "Y", Capacity = 10, ExpertSpecialties = [new ExpertSpecialty { Specialty = specialty }] };
+            db.AddRange(specialty, x, y);
+            await db.SaveChangesAsync();
+            (specialtyId, xId, yId) = (specialty.Id, x.Id, y.Id);
+            for (var i = 0; i < 2; i++) db.Requests.Add(AssignedRequest($"ratio-x-{i}", specialtyId, xId));
+            for (var i = 0; i < 3; i++) db.Requests.Add(AssignedRequest($"ratio-y-{i}", specialtyId, yId));
+            await db.SaveChangesAsync();
+        }
+
+        var result = await CreateAsync("ratio-new", RequestPriority.Normal, specialtyId);
+
+        Assert.Equal(RequestStatus.Assigned, result.Status);
+        Assert.Equal(yId, result.AssignedExpertId);
+    }
+
+    [Fact]
+    public async Task Close_serves_urgent_first_and_new_requests_wait_behind_the_queue()
+    {
+        for (var i = 0; i < 5; i++) await CreateAsync($"fill-{i}", RequestPriority.Normal);
+        var normal = await CreateAsync("queued-normal", RequestPriority.Normal);
+        var urgent = await CreateAsync("queued-urgent", RequestPriority.Urgent);
+        Assert.Equal(RequestStatus.Pending, normal.Status);
+        Assert.Equal(RequestStatus.Pending, urgent.Status);
+
+        // First freed slot goes to the Urgent request even though the Normal one is older.
+        await CloseAsync((await IdOfAsync("fill-0")));
+        Assert.Equal(RequestStatus.Assigned, await StatusAsync(urgent.Id));
+        Assert.Equal(RequestStatus.Pending, await StatusAsync(normal.Id));
+
+        // A request arriving now must not take the next slot ahead of the queued Normal one.
+        var latecomer = await CreateAsync("latecomer", RequestPriority.Normal);
+        Assert.Equal(RequestStatus.Pending, latecomer.Status);
+        await CloseAsync((await IdOfAsync("fill-1")));
+        Assert.Equal(RequestStatus.Assigned, await StatusAsync(normal.Id));
+        Assert.Equal(RequestStatus.Pending, await StatusAsync(latecomer.Id));
+    }
+
+    [Fact]
+    public async Task New_request_does_not_jump_a_queued_request_when_capacity_is_free()
+    {
+        // A queued request the worker hasn't reached yet, while the expert has free capacity.
+        long queuedId;
+        await using (var scope = _provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var queued = new ServiceRequest { RequestKey = "waiting-for-worker", SpecialtyId = _specialtyId, Priority = RequestPriority.Normal, Status = RequestStatus.Pending, CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-1) };
+            db.Requests.Add(queued);
+            await db.SaveChangesAsync();
+            queuedId = queued.Id;
+        }
+
+        var fresh = await CreateAsync("fresh", RequestPriority.Normal);
+        Assert.Equal(RequestStatus.Pending, fresh.Status);
+
+        await using (var workerScope = _provider.CreateAsyncScope())
+            await workerScope.ServiceProvider.GetRequiredService<IQueueProcessor>().ProcessBatchAsync(100, CancellationToken.None);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verify = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var queuedRow = await verify.Requests.SingleAsync(x => x.Id == queuedId);
+        var freshRow = await verify.Requests.SingleAsync(x => x.Id == fresh.Id);
+        Assert.Equal(RequestStatus.Assigned, queuedRow.Status);
+        Assert.Equal(RequestStatus.Assigned, freshRow.Status);
+        Assert.True(queuedRow.AssignedAt <= freshRow.AssignedAt, "the queued request must be served first");
+    }
+
+    [Fact]
+    public async Task Normal_request_waiting_30_minutes_is_served_before_a_fresh_urgent_one()
+    {
+        for (var i = 0; i < 5; i++) await CreateAsync($"busy-{i}", RequestPriority.Normal);
+        long agedId, urgentId;
+        await using (var scope = _provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var aged = new ServiceRequest { RequestKey = "aged-normal", SpecialtyId = _specialtyId, Priority = RequestPriority.Normal, Status = RequestStatus.Pending, CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-45) };
+            var urgent = new ServiceRequest { RequestKey = "fresh-urgent", SpecialtyId = _specialtyId, Priority = RequestPriority.Urgent, Status = RequestStatus.Pending, CreatedAt = DateTimeOffset.UtcNow };
+            db.Requests.AddRange(aged, urgent);
+            await db.SaveChangesAsync();
+            (agedId, urgentId) = (aged.Id, urgent.Id);
+        }
+
+        await CloseAsync(await IdOfAsync("busy-0"));
+
+        Assert.Equal(RequestStatus.Assigned, await StatusAsync(agedId));
+        Assert.Equal(RequestStatus.Pending, await StatusAsync(urgentId));
+    }
+
+    private async Task<CreateRequestResult> CreateAsync(string key, RequestPriority priority, int? specialtyId = null)
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        return await scope.ServiceProvider.GetRequiredService<IRequestService>()
+            .CreateAsync(new CreateRequestCommand(key, specialtyId ?? _specialtyId, priority), CancellationToken.None);
+    }
+
+    private async Task CloseAsync(long id)
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        await scope.ServiceProvider.GetRequiredService<IRequestService>().CloseAsync(id, CancellationToken.None);
+    }
+
+    private async Task<RequestStatus> StatusAsync(long id)
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        return (await scope.ServiceProvider.GetRequiredService<AppDbContext>().Requests.AsNoTracking().SingleAsync(x => x.Id == id)).Status;
+    }
+
+    private async Task<long> IdOfAsync(string key)
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        return (await scope.ServiceProvider.GetRequiredService<AppDbContext>().Requests.AsNoTracking().SingleAsync(x => x.RequestKey == key)).Id;
+    }
+
+    private static ServiceRequest AssignedRequest(string key, int specialtyId, int expertId) => new()
+    {
+        RequestKey = key, SpecialtyId = specialtyId, Priority = RequestPriority.Normal, Status = RequestStatus.Assigned,
+        AssignedExpertId = expertId, CreatedAt = DateTimeOffset.UtcNow, AssignedAt = DateTimeOffset.UtcNow,
+    };
 
     private ServiceProvider BuildInstanceProvider()
     {
