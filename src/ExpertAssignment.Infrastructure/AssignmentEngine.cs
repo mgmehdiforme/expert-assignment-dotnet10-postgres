@@ -69,15 +69,49 @@ public sealed class AssignmentEngine(AppDbContext db, IClock clock)
             return false;
         }
 
-        var now = clock.UtcNow;
-        request.Status = RequestStatus.Assigned;
-        request.AssignedExpertId = selected.Id;
-        request.AssignedAt = now;
-        selected.LastAssignedAt = now;
-        db.AssignmentHistory.Add(new AssignmentHistory { RequestId = request.Id, ExpertId = selected.Id, AssignedAt = now });
+        Assign(request, selected);
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
         return true;
+    }
+
+    /// <summary>
+    /// Gives a just-freed slot of <paramref name="expert"/> to the first queued request it can serve.
+    /// Must run inside the caller's transaction while the caller holds the expert's row lock, so no
+    /// newly created request can take the slot first. The queued request is locked with SKIP LOCKED
+    /// (never waited on), and no other expert is locked, so this cannot deadlock with TryAssignAsync.
+    /// Returns the assigned request id, or null when nothing is queued or the expert can't take work.
+    /// </summary>
+    public async Task<long?> AssignNextQueuedToLockedExpertAsync(Expert expert, CancellationToken ct)
+    {
+        if (!expert.IsActive) return null;
+        var open = await db.Requests.CountAsync(x => x.Status == RequestStatus.Assigned && x.AssignedExpertId == expert.Id, ct);
+        if (open >= expert.Capacity) return null;
+
+        var next = (await db.Requests.FromSqlRaw($$"""
+            SELECT r.*
+            FROM requests r
+            WHERE r."Status" = 0
+              AND r."SpecialtyId" IN (SELECT es."SpecialtyId" FROM expert_specialties es WHERE es."ExpertId" = @expertId)
+            ORDER BY {{QueueOrder.OrderBy}}
+            LIMIT 1
+            FOR UPDATE OF r SKIP LOCKED
+            """, new NpgsqlParameter("expertId", expert.Id)).ToListAsync(ct)).SingleOrDefault();
+        if (next is null) return null;
+
+        Assign(next, expert);
+        await db.SaveChangesAsync(ct);
+        return next.Id;
+    }
+
+    private void Assign(ServiceRequest request, Expert expert)
+    {
+        var now = clock.UtcNow;
+        request.Status = RequestStatus.Assigned;
+        request.AssignedExpertId = expert.Id;
+        request.AssignedAt = now;
+        expert.LastAssignedAt = now;
+        db.AssignmentHistory.Add(new AssignmentHistory { RequestId = request.Id, ExpertId = expert.Id, AssignedAt = now });
     }
 
     private sealed record Candidate(Expert Expert, int Open);

@@ -30,11 +30,26 @@ public sealed class RequestService(AppDbContext db, AssignmentEngine engine, ICl
             return ToResult(existing, true);
         }
 
-        // Fast path. The durable BackgroundService retries any request not assigned here.
-        await engine.TryAssignAsync(entity.Id, ct);
+        // Fast path: assign immediately, unless an older or higher-priority request of the same
+        // specialty is still queued. Then the new request waits its turn and the worker (or the
+        // next close) serves the queue in order. Anything not assigned here is retried by the worker.
+        if (!await HasQueuedRequestAheadAsync(entity.Id, ct))
+            await engine.TryAssignAsync(entity.Id, ct);
         await db.Entry(entity).ReloadAsync(ct);
         return ToResult(entity, false);
     }
+
+    private async Task<bool> HasQueuedRequestAheadAsync(long requestId, CancellationToken ct) =>
+        await db.Database.SqlQueryRaw<bool>($$"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM requests me
+                JOIN requests r ON r."SpecialtyId" = me."SpecialtyId" AND r."Id" <> me."Id"
+                WHERE me."Id" = {0}
+                  AND r."Status" = 0
+                  AND {{QueueOrder.KeyOf("r")}} < {{QueueOrder.KeyOf("me")}}
+            ) AS "Value"
+            """, requestId).SingleAsync(ct);
 
     public async Task<RequestDto?> GetAsync(long id, CancellationToken ct)
     {
@@ -53,16 +68,20 @@ public sealed class RequestService(AppDbContext db, AssignmentEngine engine, ICl
             throw new InvalidOperationException("Only an assigned request can be closed.");
 
         // Same lock order as assignment: request first, then expert.
-        _ = await db.Experts.FromSqlInterpolated($"SELECT * FROM experts WHERE \"Id\" = {request.AssignedExpertId.Value} FOR UPDATE")
-            .ToListAsync(ct);
+        var expert = (await db.Experts.FromSqlInterpolated($"SELECT * FROM experts WHERE \"Id\" = {request.AssignedExpertId.Value} FOR UPDATE")
+            .ToListAsync(ct)).Single();
         var history = await db.AssignmentHistory.Where(x => x.RequestId == id && x.UnassignedAt == null)
             .OrderByDescending(x => x.Id).FirstOrDefaultAsync(ct);
         if (history is not null) history.UnassignedAt = clock.UtcNow;
         request.Status = RequestStatus.Closed;
         request.ClosedAt = clock.UtcNow;
         await db.SaveChangesAsync(ct);
+
+        // Hand the freed slot to the next queued request in the same transaction, while the
+        // expert lock is still held. Otherwise a request created in the gap before the worker's
+        // next poll could take the slot ahead of older or Urgent queued requests.
+        await engine.AssignNextQueuedToLockedExpertAsync(expert, ct);
         await tx.CommitAsync(ct);
-        // The shared database queue is polled by all instances; no in-memory signal is required.
     }
 
     private static CreateRequestResult ToResult(ServiceRequest x, bool existed) => new(x.Id, x.Status, x.AssignedExpertId, existed);

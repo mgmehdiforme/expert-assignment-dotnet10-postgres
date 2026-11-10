@@ -10,7 +10,7 @@ public sealed class QueueProcessor(AppDbContext db, AssignmentEngine engine) : I
         // Filter out pending requests that have no active matching expert with free
         // capacity. This prevents an unserviceable request from blocking later work.
         // Capacity is checked again under expert row locks inside TryAssignAsync.
-        var ids = await db.Database.SqlQueryRaw<long>("""
+        var ids = await db.Database.SqlQueryRaw<long>($$"""
             SELECT r."Id" AS "Value"
             FROM requests r
             WHERE r."Status" = 0
@@ -27,10 +27,7 @@ public sealed class QueueProcessor(AppDbContext db, AssignmentEngine engine) : I
                           AND open_request."AssignedExpertId" = e."Id"
                     )
               )
-            ORDER BY
-              CASE WHEN r."Priority" = 1 OR r."CreatedAt" <= now() - interval '30 minutes' THEN 0 ELSE 1 END,
-              r."CreatedAt",
-              r."Id"
+            ORDER BY {{QueueOrder.OrderBy}}
             LIMIT {0}
             """, batchSize).ToListAsync(ct);
 
