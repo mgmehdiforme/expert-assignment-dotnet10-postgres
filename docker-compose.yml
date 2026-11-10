@@ -1,11 +1,12 @@
 services:
   postgres:
+    restart: unless-stopped
     image: postgres:17-alpine
     environment:
       POSTGRES_DB: expert_assignment
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d expert_assignment"]
       interval: 5s
@@ -13,12 +14,13 @@ services:
       retries: 20
     volumes: ["pgdata:/var/lib/postgresql/data"]
   api1:
+    restart: unless-stopped
     build: .
     environment:
       ASPNETCORE_URLS: http://+:8080
       ConnectionStrings__Default: Host=postgres;Port=5432;Database=expert_assignment;Username=postgres;Password=postgres
       SeedDemoData: "true"
-    ports: ["8081:8080"]
+    ports: ["127.0.0.1:8091:8080"]
     depends_on: { postgres: { condition: service_healthy } }
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -27,12 +29,13 @@ services:
       retries: 20
       start_period: 10s
   api2:
+    restart: unless-stopped
     build: .
     environment:
       ASPNETCORE_URLS: http://+:8080
       ConnectionStrings__Default: Host=postgres;Port=5432;Database=expert_assignment;Username=postgres;Password=postgres
       SeedDemoData: "false"
-    ports: ["8082:8080"]
+    ports: ["127.0.0.1:8092:8080"]
     depends_on:
       postgres: { condition: service_healthy }
       api1: { condition: service_healthy }
