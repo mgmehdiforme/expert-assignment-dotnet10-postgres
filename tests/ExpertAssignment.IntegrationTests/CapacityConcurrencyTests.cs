@@ -22,7 +22,7 @@ public sealed class CapacityConcurrencyTests : IAsyncLifetime
         _secondInstanceProvider = BuildInstanceProvider();
         await using var scope = _provider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        await db.Database.EnsureCreatedAsync();
+        await db.Database.MigrateAsync(); // same schema path as production
         var specialty = new Specialty { Name = "Technical" };
         var expert = new Expert { Name = "Capacity-5", Capacity = 5, IsActive = true, ExpertSpecialties = [new ExpertSpecialty { Specialty = specialty }] };
         db.AddRange(specialty, expert);
