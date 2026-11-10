@@ -20,9 +20,10 @@ This is safe across multiple API/worker instances because PostgreSQL row locks a
 docker compose up --build
 ```
 
-- Swagger/API instance 1: http://localhost:8081/swagger
-- Swagger/API instance 2: http://localhost:8082/swagger
-- Both use the same PostgreSQL database.
+- Swagger/API instance 1: http://localhost:8091/swagger
+- Swagger/API instance 2: http://localhost:8092/swagger
+- Both use the same PostgreSQL database (`127.0.0.1:5432`, database `expert_assignment`, user/password `postgres`/`postgres` — local dev only).
+- All three containers use `restart: unless-stopped`, so they come back after a reboot.
 - The first instance seeds Legal, Technical, Financial and sample experts.
 
 For a production deployment, run EF migrations once as a deployment job rather than letting every replica migrate concurrently. The sample startup migration is convenient for local development.
@@ -62,13 +63,26 @@ Get status:
 GET /api/requests/1
 ```
 
-## Migrations
+## Solution
 
-The initial schema is in `database/001_initial_schema.sql`. To create EF migration metadata in a local SDK environment:
+Open `ExpertAssignment.sln` (classic solution format) in Visual Studio / Rider / VS Code, or build from the command line:
 
 ```bash
-dotnet tool install --global dotnet-ef --version 10.0.0
-dotnet ef migrations add InitialCreate --project src/ExpertAssignment.Infrastructure --startup-project src/ExpertAssignment.Api
+dotnet build ExpertAssignment.sln
+```
+
+## Migrations
+
+The schema is the EF Core migration `InitialCreate` in `src/ExpertAssignment.Infrastructure/Migrations` (with its model snapshot). `database/001_initial_schema.sql` is generated from it for review:
+
+```bash
+dotnet ef migrations script --idempotent --project src/ExpertAssignment.Infrastructure --startup-project src/ExpertAssignment.Api -o database/001_initial_schema.sql
+```
+
+After a model change, add a new migration (never edit `InitialCreate`):
+
+```bash
+dotnet ef migrations add <Name> --project src/ExpertAssignment.Infrastructure --startup-project src/ExpertAssignment.Api
 ```
 
 The API calls `Database.Migrate()` on startup. For production, apply migrations once from a migration job. Do not have every replica run migrations simultaneously.
@@ -76,14 +90,29 @@ The API calls `Database.Migrate()` on startup. For production, apply migrations 
 ## Tests
 
 ```bash
-dotnet test tests/ExpertAssignment.IntegrationTests/ExpertAssignment.IntegrationTests.csproj
+dotnet test ExpertAssignment.sln
 ```
 
-The Testcontainers test starts a real PostgreSQL 17 container and submits 20 concurrent requests against one expert with capacity 5. Expected: 5 Assigned, 15 Pending, never more than 5 open.
+Requires Docker (Testcontainers starts a throwaway PostgreSQL 17 container per test and applies the real EF migration). The tests cover:
+- 20 concurrent requests from two service instances against one expert with capacity 5 → 5 Assigned, 15 Pending.
+- The same `RequestKey` sent 12 times concurrently → one request.
+- A request with no matching expert does not block a later eligible one.
+- Closing a request hands the freed slot straight to the next queued request.
+- The task's ratio example: 2/4 vs 3/10 → the 3/10 expert is chosen.
+- On close, Urgent beats an older Normal, and a request arriving afterwards waits behind the queue.
+- A new request does not jump a queued one even when capacity is free.
+- A Normal request waiting 30+ minutes is served before a fresh Urgent one.
 
 ## Priority and starvation policy
 
-Urgent requests are in the top tier. A Normal request waiting at least 30 minutes is promoted into the same tier. FIFO by `CreatedAt`, then ID, is used within each tier. Requests without an eligible expert are skipped; later eligible requests are still attempted. The worker polls the durable database queue, so a restart does not lose pending work.
+Urgent requests are in the top tier. A Normal request waiting at least 30 minutes is promoted into the same tier. FIFO by `CreatedAt`, then ID, is used within each tier. Requests without an eligible expert are skipped; later eligible requests are still attempted. The order is defined once in `QueueOrder.cs` and used everywhere below.
+
+How the queue is served, so new arrivals never jump it:
+- **On close**: the same transaction that closes a request gives the freed slot to the first queued request that expert can serve, while it still holds the expert's row lock. A request created at that moment waits for the lock, then finds the expert full.
+- **On create**: the immediate assignment is skipped when an older or higher-tier request of the same specialty is queued; the new request waits its turn.
+- **Worker**: every instance polls the durable database queue (1.5 s) and catches everything else (e.g. capacity freed some other way). A restart loses no pending work.
+
+Example (one expert, full; a slot frees at 10:25): queued N1 Normal 09:40 (aged → top tier), U1 Urgent 10:20, N2 Normal 10:10 → served N1, U1, N2. A request for a specialty with no available expert is skipped and does not block them.
 
 ## Production notes
 
@@ -93,14 +122,3 @@ Urgent requests are in the top tier. A Normal request waiting at least 30 minute
 - Add an outbox if assignment triggers external side effects (email, webhook, CRM). Do not send external calls inside the DB transaction.
 - For expert capacity/status updates, acquire the corresponding expert row lock before changing those fields.
 - `RequestKey` uniqueness is enforced by PostgreSQL, not only application code.
-
-## EF migration commands
-
-The repository includes the `InitialCreate` EF Core migration under `src/ExpertAssignment.Infrastructure/Migrations` and the equivalent reviewable SQL under `database/001_initial_schema.sql`.
-
-```bash
-dotnet tool install --global dotnet-ef --version 10.0.0
-dotnet ef database update --project src/ExpertAssignment.Infrastructure --startup-project src/ExpertAssignment.Api
-```
-
-Do not run `migrations add InitialCreate` again; that migration is already included.
